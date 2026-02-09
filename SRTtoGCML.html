@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>SRT to GCML Converter (v33)</title>
+    <style>
+        body { font-family: sans-serif; max-width: 600px; margin: 20px auto; padding: 10px; border: 1px solid #ccc; border-radius: 8px; }
+        h1 { text-align: center; }
+        input[type="file"] { display: block; margin-top: 10px; }
+        #status { text-align: center; font-weight: bold; }
+        label { font-weight: bold; }
+        select { margin-left: 10px; padding: 5px; }
+        .config-section { margin-top: 15px; }
+        .config-section label { font-weight: normal; margin-left: 5px; }
+        .config-title { font-weight: bold; margin-bottom: 5px; }
+        .filter-list-upload { padding-bottom: 10px; border-bottom: 1px dashed #ccc; }
+        .filter-list-upload .note { font-size: 0.9em; color: #555; margin-top: 5px; }
+    </style>
+</head>
+<body>
+    <h1>SRT → GCML 変換ツール (v33: 結合不具合修正版)</h1>
+    <p>1. 下のオプションを設定してください。</p>
+    <p>2. <strong>.srt</strong> ファイルを選択すると、自動的に <strong>.gcml</strong> ファイルがダウンロードされます。</p>
+    
+    <hr>
+
+    <div class="config-section">
+        <div class="config-title">1. 字幕の色:</div>
+        <select id="fontColorSelect">
+            <option value="white" selected>白</option>
+            <option value="cyan">水色</option>
+            <option value="green">緑</option>
+            <option value="yellow">黄色</option>
+            <option value="LightOrange">オレンジ</option>
+            <option value="PaleMagenta">ピンク</option>
+        </select>
+    </div>
+
+    <div class="config-section">
+        <div class="config-title">2. 変換ルール:</div>
+
+        <div class="filter-list-upload">
+            <label for="filterFile">A. フィルターリスト (任意):</label>
+            <input type="file" id="filterFile" accept=".csv,.txt">
+            <div class="note">※ <code>置換前,置換後</code> のCSV/TXTを先に読み込ませてください。</div>
+        </div>
+
+        <label style="margin-top: 10px; display: block;">B. チェックボックスルール:</label>
+        
+        <div>
+            <input type="checkbox" id="chkMergeShortPages" checked>
+            <label for="chkMergeShortPages">表示時間が短い (1秒20F以下) ページを結合する</label>
+        </div>
+
+        <div>
+            <input type="checkbox" id="chkReplaceEnvChars" checked>
+            <label for="chkReplaceEnvChars">環境依存文字 (①, ㈱, ㎜ など) を ＊ に置き換える</label>
+        </div>
+        <div>
+            <input type="checkbox" id="chkRemovePunctuation" checked>
+            <label for="chkRemovePunctuation">句読点 (、。．,) を削除する</label>
+        </div>
+        <div>
+            <input type="checkbox" id="chkToFullWidth" checked>
+            <label for="chkToFullWidth">半角英数字/記号 (!?) を全角にする</label>
+        </div>
+        <div>
+            <input type="checkbox" id="chkHyphenToChoonpu" checked>
+            <label for="chkHyphenToChoonpu">ハイフン (-) を長音符 (ー) にする</label>
+        </div>
+    </div>
+    
+    <div class="config-section">
+        <div class="config-title">3. .srt ファイルの選択:</div>
+        <input type="file" id="srtFile" accept=".srt">
+    </div>
+
+    <p id="status"></p>
+
+    <script>
+        let filterRules = [];
+
+        document.getElementById('filterFile').addEventListener('change', handleFilterFile, false);
+        document.getElementById('srtFile').addEventListener('change', handleFileSelect, false);
+
+        function handleFilterFile(evt) {
+            const file = evt.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.readAsText(file, 'UTF-8');
+            reader.onload = function(e) {
+                const text = e.target.result;
+                filterRules = []; 
+                const lines = text.split('\n');
+                for (const line of lines) {
+                    if (line.trim() === "") continue;
+                    const parts = line.split(',');
+                    if (parts.length >= 2 && parts[0].trim() !== "") {
+                        const find = parts[0];
+                        const replace = parts.slice(1).join(','); 
+                        filterRules.push({ find: find, replace: replace });
+                    }
+                }
+                document.getElementById('status').innerText = `フィルターリスト ${filterRules.length} 件を読み込みました。SRTファイルを選択してください。`;
+            };
+        }
+
+        function escapeRegExp(string) {
+          return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        }
+
+        function toFullWidth(str) {
+            if (!str) return "";
+            return str.replace(/[0-9a-zA-Z!?]/g, function(s) {
+                return String.fromCharCode(s.charCodeAt(0) + 0xFEE0);
+            });
+        }
+        
+        function parseTimeToMs(h, m, s, ms) {
+            return (parseInt(h, 10) * 3600 + parseInt(m, 10) * 60 + parseInt(s, 10)) * 1000 + parseInt(ms, 10);
+        }
+
+        function handleFileSelect(evt) {
+            const file = evt.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.readAsText(file, 'UTF-8');
+            
+            reader.onload = function(e) {
+                const srtContent = e.target.result;
+                const selectedColor = document.getElementById('fontColorSelect').value;
+                
+                const options = {
+                    mergeShortPages: document.getElementById('chkMergeShortPages').checked,
+                    replaceEnvChars: document.getElementById('chkReplaceEnvChars').checked,
+                    removePunctuation: document.getElementById('chkRemovePunctuation').checked,
+                    toFullWidth: document.getElementById('chkToFullWidth').checked,
+                    hyphenToChoonpu: document.getElementById('chkHyphenToChoonpu').checked,
+                    filterRules: filterRules 
+                };
+
+                try {
+                    const gcmlContent = convertSrtToGcml(srtContent, selectedColor, options);
+                    const outputFilename = file.name.replace(/\.srt$/i, '') + '.gcml';
+                    downloadFile(gcmlContent, outputFilename, 'application/xml');
+                    document.getElementById('status').innerText = `変換完了: ${outputFilename} がダウンロードされました。(フィルター ${options.filterRules.length} 件適用)`;
+                } catch (err) {
+                    document.getElementById('status').innerText = `エラー: ${err.message}`;
+                }
+            };
+        }
+
+        function downloadFile(content, fileName, contentType) {
+            const a = document.createElement('a');
+            const file = new Blob([content], {type: contentType});
+            a.href = URL.createObjectURL(file);
+            a.download = fileName;
+            a.click();
+            URL.revokeObjectURL(a.href);
+        }
+
+        function convertSrtToGcml(srt, fontColor, options) {
+            let captions = [];
+            const blocks = srt.split(/\n\s*\n/);
+            const srtTimeFormat = /(\d{2}):(\d{2}):(\d{2}),(\d{3}) --> (\d{2}):(\d{2}):(\d{2}),(\d{3})/;
+
+            for (const block of blocks) {
+                if (block.trim() === "") continue;
+                const lines = block.split('\n');
+                if (lines.length < 2) continue;
+
+                const timeLine = lines[1].match(srtTimeFormat);
+                if (!timeLine) continue;
+
+                const startTime = `${timeLine[1]}:${timeLine[2]}:${timeLine[3]}.${timeLine[4]}`;
+                const startTimeMs = parseTimeToMs(timeLine[1], timeLine[2], timeLine[3], timeLine[4]);
+                const endTimeMs = parseTimeToMs(timeLine[5], timeLine[6], timeLine[7], timeLine[8]);
+                const durationMs = endTimeMs - startTimeMs;
+
+                const textLines = lines.slice(2)
+                                     .map(l => {
+                                        let processedLine = l.replace(/[\r\n]+$/, '');
+                                        if (options.filterRules && options.filterRules.length > 0) {
+                                            for (const rule of options.filterRules) {
+                                                const findRegExp = new RegExp(escapeRegExp(rule.find), 'g');
+                                                processedLine = processedLine.replace(findRegExp, rule.replace);
+                                            }
+                                        }
+
+                                        if (options.replaceEnvChars) {
+                                            processedLine = processedLine.replace(/[\u2460-\u2473\u32D0-\u32FE\u2160-\u217F\u3300-\u3357\u3231\u3232\u2121\u2116]/g, '＊');
+                                        }
+                                        if (options.toFullWidth) {
+                                            processedLine = toFullWidth(processedLine);
+                                        }
+                                        if (options.removePunctuation) {
+                                            processedLine = processedLine.replace(/[、。,.，．]/g, '');
+                                        }
+                                        if (options.hyphenToChoonpu) {
+                                            processedLine = processedLine.replace(/-/g, 'ー');
+                                        }
+                                        return processedLine;
+                                     })
+                                     .filter(l => l !== ""); 
+                
+                captions.push({ startTime, startTimeMs, textLines, durationMs });
+            }
+
+            // 結合処理
+            let finalCaptions = captions;
+
+            if (options.mergeShortPages) {
+                let workCaptions = JSON.parse(JSON.stringify(captions));
+                const mergeThresholdMs = 1667; 
+                // ***** 修正点 (v33): 結合を許可する最大間隔 (3秒) *****
+                // これ以上離れている場合は、たとえ短くても結合しない
+                const maxGapMs = 3000; 
+
+                let i = 0;
+
+                while (i < workCaptions.length) {
+                    const current = workCaptions[i];
+
+                    if (current.durationMs <= mergeThresholdMs && workCaptions.length > 1) {
+                        const prevIdx = i - 1;
+                        const nextIdx = i + 1;
+                        
+                        const prev = (prevIdx >= 0) ? workCaptions[prevIdx] : null;
+                        const next = (nextIdx < workCaptions.length) ? workCaptions[nextIdx] : null;
+
+                        // ***** 修正点 (v33): 間隔(Gap)の計算とチェック *****
+                        let gapToPrev = Infinity;
+                        let gapToNext = Infinity;
+
+                        // 前の字幕の終了と、今の字幕の開始の差
+                        if (prev) {
+                            gapToPrev = current.startTimeMs - (prev.startTimeMs + prev.durationMs);
+                        }
+                        // 今の字幕の終了と、次の字幕の開始の差
+                        if (next) {
+                            gapToNext = next.startTimeMs - (current.startTimeMs + current.durationMs);
+                        }
+
+                        let canMergePrev = (prev && gapToPrev <= maxGapMs);
+                        let canMergeNext = (next && gapToNext <= maxGapMs);
+                        // ***** 修正ここまで *****
+
+                        let mergeTarget = null; 
+
+                        if (canMergePrev && !canMergeNext) {
+                            mergeTarget = 'prev';
+                        } else if (!canMergePrev && canMergeNext) {
+                            mergeTarget = 'next';
+                        } else if (canMergePrev && canMergeNext) {
+                            // 両方結合可能なら、元々の持続時間が短い方と結合する (バランスをとるため)
+                            if (prev.durationMs <= next.durationMs) {
+                                mergeTarget = 'prev';
+                            } else {
+                                mergeTarget = 'next';
+                            }
+                        }
+
+                        if (mergeTarget === 'prev') {
+                            // 前に結合
+                            workCaptions[prevIdx].durationMs = (current.startTimeMs + current.durationMs) - workCaptions[prevIdx].startTimeMs;
+                            workCaptions[prevIdx].textLines = workCaptions[prevIdx].textLines.concat(current.textLines);
+                            workCaptions.splice(i, 1);
+                            // 削除したのでインデックスは進めない（次のループで新しいiを再評価）
+                        } else if (mergeTarget === 'next') {
+                            // 後ろに結合
+                            const newDuration = (workCaptions[nextIdx].startTimeMs + workCaptions[nextIdx].durationMs) - current.startTimeMs;
+                            workCaptions[nextIdx].startTime = current.startTime;     
+                            workCaptions[nextIdx].startTimeMs = current.startTimeMs; 
+                            workCaptions[nextIdx].durationMs = newDuration;          
+                            workCaptions[nextIdx].textLines = current.textLines.concat(workCaptions[nextIdx].textLines);
+                            workCaptions.splice(i, 1);
+                            // 削除したのでインデックスは進めない
+                        } else {
+                            // 結合相手がいない（両方とも遠すぎる）場合は次へ
+                            i++;
+                        }
+
+                    } else {
+                        i++;
+                    }
+                }
+                finalCaptions = workCaptions;
+            }
+
+
+            const now = new Date();
+            const createDate = `${now.getFullYear()}/${(now.getMonth() + 1).toString().padStart(2, '0')}/${now.getDate().toString().padStart(2, '0')}`;
+            const createTime = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
+
+            let gcml = `<?xml version="1.0" encoding="UTF-8"?>
+<gcml version="1.0">
+  <head>
+    <style type="text/css" left="180" top="30" width="620" height="480" font-size="36" font-hsp="4" font-vsp="24" font-color="${fontColor}"/>
+    <meta>
+      <event_info broadcast_name="BSY" event_code="YOUR_EVENT_CODE" event_title="YOUR_TITLE" event_sub_title="" language_code="jpn" media_flag=" * " video_flag="* " expiration_date="" creator_name="YOUR_NAME" create_date="${createDate}" create_time="${createTime}" onair_date_start="" onair_date_end="" onair_time="" onair_duration=""/>
+    </meta>
+  </head>
+  <body style="left:180;top:30;width:620;height:480;font-size:36;font-hsp:4;font-vsp:24;font-color:${fontColor};" resolution="960x540" display_aspect_ration="16v9" caption_max_bitrate="256000" caption_management_data_interval="1000" caption_background_type="TRANSPARENT" start_offset_time="0" duration="">
+`;
+
+            finalCaptions.forEach((cap, i) => {
+                const pageNum = i + 1;
+                const divStyle = 'style="left:180;top:30;width:620;height:480;font-size:36;font-hsp:4;font-vsp:24;" caption_background_type="SEMITRANSPARENT" caption_background_color="black"';
+                gcml += `    <div page="${pageNum}" start_time="${cap.startTime}" ${divStyle}>\n`;
+
+                const maxChars = 15;
+                const processedLines = []; 
+                cap.textLines.forEach(originalLine => {
+                    if (originalLine.length <= maxChars) {
+                        processedLines.push(originalLine);
+                    } else {
+                        let tempLine = originalLine;
+                        while (tempLine.length > 0) {
+                            processedLines.push(tempLine.substring(0, maxChars));
+                            tempLine = tempLine.substring(maxChars);
+                        }
+                    }
+                });
+
+                const lineHeight = 60; 
+                const startY = 330; 
+
+                processedLines.forEach((line, j) => {
+                    const topPos = startY + (j * lineHeight); 
+                    const pStyle = `style="left:180;top:${topPos};font-size:36;font-color:${fontColor};" caption_background_type="SEMITRANSPARENT" caption_background_color="black" language="jpn"`;
+                    gcml += `      <p ${pStyle}><![CDATA[${line}]]></p>\n`;
+                });
+
+                gcml += '    </div>\n';
+            });
+
+            gcml += '  </body>\n</gcml>\n';
+            return gcml;
+        }
+    </script>
+</body>
+</html>
