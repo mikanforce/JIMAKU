@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>GCML to SRT Converter (v1)</title>
+  <style>
+    body { font-family: sans-serif; max-width: 720px; margin: 20px auto; padding: 10px; border: 1px solid #ccc; border-radius: 8px; }
+    h1 { text-align: center; }
+    input[type="file"] { display: block; margin-top: 10px; }
+    #status { text-align: center; font-weight: bold; }
+    label { font-weight: bold; }
+    select, input[type="number"] { margin-left: 10px; padding: 5px; }
+    .config-section { margin-top: 15px; }
+    .config-title { font-weight: bold; margin-bottom: 5px; }
+    .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .note { font-size: 0.9em; color: #555; margin-top: 6px; }
+    code { background: #f6f6f6; padding: 1px 4px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>GCML → SRT 変換ツール (v1)</h1>
+  <p>1. 下のオプションを設定してください。</p>
+  <p>2. <strong>.gcml</strong> ファイルを選択すると、自動的に <strong>.srt</strong> がダウンロードされます。</p>
+
+  <hr>
+
+  <div class="config-section">
+    <div class="config-title">1. 文字コード（GCML読み込み）:</div>
+    <div class="row">
+      <label for="encodingSelect">読み込み:</label>
+      <select id="encodingSelect">
+        <option value="auto" selected>自動（UTF-8→Shift_JIS/CP932）</option>
+        <option value="utf-8">UTF-8固定</option>
+        <option value="shift_jis">Shift_JIS/CP932固定</option>
+      </select>
+    </div>
+    <div class="note">
+      ※ ブラウザ標準の <code>TextDecoder</code> を使用します。環境によっては Shift_JIS が未対応の場合があります（その場合 UTF-8 にフォールバック）。
+    </div>
+  </div>
+
+  <div class="config-section">
+    <div class="config-title">2. タイムコード推定（重要）:</div>
+    <div class="row">
+      <label for="lastDurationSec">最後の字幕の長さ(秒):</label>
+      <input type="number" id="lastDurationSec" value="2.0" min="0.1" step="0.1" />
+    </div>
+    <div style="margin-top:8px;">
+      <input type="checkbox" id="chkEndMinus1ms" checked />
+      <label for="chkEndMinus1ms" style="font-weight: normal;">次の開始時刻を終了時刻にする場合、1ms引く（重なり回避）</label>
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <label for="minDurationMs">最小表示時間(ms):</label>
+      <input type="number" id="minDurationMs" value="500" min="0" step="10" />
+    </div>
+    <div class="note">
+      ※ 多くのGCMLは各ページの「終了時刻」を持たないので、基本は「次のstart_time」を終了として推定します。最後だけ上の秒数を加算します。
+    </div>
+  </div>
+
+  <div class="config-section">
+    <div class="config-title">3. .gcml ファイルの選択:</div>
+    <input type="file" id="gcmlFile" accept=".gcml,.xml" />
+  </div>
+
+  <p id="status"></p>
+
+  <script>
+    document.getElementById('gcmlFile').addEventListener('change', handleFileSelect, false);
+
+    function normalizeNewlines(s) {
+      return (s || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    }
+
+    // ---- 文字コード対策（UTF-8 / Shift_JIS）----
+    async function readFileWithEncoding(file, encodingMode) {
+      const buf = await file.arrayBuffer();
+
+      if (typeof TextDecoder === "undefined") {
+        const fallback = await readAsTextFallback(file);
+        return { text: fallback, usedEncoding: "utf-8(fallback)" };
+      }
+
+      const decode = (enc, fatal) => new TextDecoder(enc, { fatal: !!fatal }).decode(buf);
+
+      if (encodingMode === "utf-8") {
+        return { text: decode("utf-8", false), usedEncoding: "utf-8" };
+      }
+
+      if (encodingMode === "shift_jis") {
+        try {
+          return { text: decode("shift_jis", false), usedEncoding: "shift_jis/cp932" };
+        } catch (e) {
+          return { text: decode("utf-8", false), usedEncoding: "utf-8(fallback)" };
+        }
+      }
+
+      // auto: UTF-8(fatal) → 失敗なら shift_jis
+      try {
+        const t = decode("utf-8", true);
+        return { text: t, usedEncoding: "utf-8(auto)" };
+      } catch (e) {
+        try {
+          const t = decode("shift_jis", false);
+          return { text: t, usedEncoding: "shift_jis/cp932(auto)" };
+        } catch (e2) {
+          const t = decode("utf-8", false);
+          return { text: t, usedEncoding: "utf-8(fallback)" };
+        }
+      }
+    }
+
+    function readAsTextFallback(file) {
+      return new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onerror = () => reject(new Error("ファイル読み込みに失敗しました。"));
+        r.onload = (e) => resolve((e.target && e.target.result) ? e.target.result : "");
+        r.readAsText(file, "UTF-8");
+      });
+    }
+
+    function downloadFile(content, fileName, contentType) {
+      const a = document.createElement('a');
+      const blob = new Blob([content], { type: contentType });
+      a.href = URL.createObjectURL(blob);
+      a.download = fileName;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }
+
+    // ---- 時刻変換 ----
+    // GCML: "HH:MM:SS.mmm" or "HH:MM:SS,mmm" を想定
+    function parseGcmlTimeToMs(t) {
+      if (!t) return null;
+      const s = String(t).trim();
+      const m = s.match(/^(\d{2}):(\d{2}):(\d{2})([.,](\d{1,3}))?$/);
+      if (!m) return null;
+      const hh = parseInt(m[1], 10);
+      const mm = parseInt(m[2], 10);
+      const ss = parseInt(m[3], 10);
+      const ms = m[5] ? parseInt(m[5].padEnd(3, "0"), 10) : 0;
+      return ((hh * 3600 + mm * 60 + ss) * 1000 + ms);
+    }
+
+    function formatMsToSrtTime(ms) {
+      ms = Math.max(0, Math.floor(ms));
+      const hh = Math.floor(ms / 3600000); ms -= hh * 3600000;
+      const mm = Math.floor(ms / 60000);   ms -= mm * 60000;
+      const ss = Math.floor(ms / 1000);    ms -= ss * 1000;
+      const mmm = ms;
+
+      const pad2 = (n) => String(n).padStart(2, "0");
+      const pad3 = (n) => String(n).padStart(3, "0");
+      return `${pad2(hh)}:${pad2(mm)}:${pad2(ss)},${pad3(mmm)}`;
+    }
+
+    function clampEndTime(startMs, endMs, minDurationMs) {
+      if (endMs == null) return null;
+      if (minDurationMs == null) minDurationMs = 0;
+      const minEnd = startMs + Math.max(0, minDurationMs);
+      return Math.max(endMs, minEnd);
+    }
+
+    // ---- GCML -> SRT 本体 ----
+    function convertGcmlToSrt(gcmlText, options) {
+      const xmlText = normalizeNewlines(gcmlText);
+
+      // XMLパース
+      const parser = new DOMParser();
+      const xml = parser.parseFromString(xmlText, "application/xml");
+
+      // パースエラー検出
+      const parseError = xml.getElementsByTagName("parsererror");
+      if (parseError && parseError.length > 0) {
+        // browser依存だが、ここに入るならXMLとして壊れてる
+        throw new Error("XMLの解析に失敗しました（GCMLが壊れている可能性）。");
+      }
+
+      // divページを収集（gcml/body/div を想定。念のため div 全探索）
+      const divs = Array.from(xml.getElementsByTagName("div"))
+        .filter(d => d.getAttribute("start_time")); // start_timeがあるものだけ
+
+      if (divs.length === 0) {
+        throw new Error("start_time を持つ <div> が見つかりませんでした。GCML形式を確認してください。");
+      }
+
+      // 取り出してソート（page順 or start_time順）
+      const items = divs.map((d, idx) => {
+        const startStr = d.getAttribute("start_time") || "";
+        const startMs = parseGcmlTimeToMs(startStr);
+        if (startMs == null) {
+          return { idx, startStr, startMs: null, text: extractTextFromDiv(d) };
+        }
+        return { idx, startStr, startMs, text: extractTextFromDiv(d) };
+      });
+
+      // startMsがnullのものがあると推定できないので弾く
+      const bad = items.find(it => it.startMs == null);
+      if (bad) {
+        throw new Error(`start_time の形式が読めません: "${bad.startStr}"（例: 00:00:01.234）`);
+      }
+
+      // 時刻順に並べる（GCMLがpage順の保証がない場合の保険）
+      items.sort((a, b) => a.startMs - b.startMs);
+
+      const endMinus1ms = !!options.endMinus1ms;
+      const lastDurationMs = Math.max(100, Math.floor(options.lastDurationSec * 1000));
+      const minDurationMs = Math.max(0, Math.floor(options.minDurationMs || 0));
+
+      // 終了時刻を推定してSRT生成
+      let out = [];
+      for (let i = 0; i < items.length; i++) {
+        const cur = items[i];
+        const next = (i + 1 < items.length) ? items[i + 1] : null;
+
+        let startMs = cur.startMs;
+        let endMs;
+
+        if (next) {
+          endMs = next.startMs;
+          if (endMinus1ms) endMs = endMs - 1;
+        } else {
+          endMs = startMs + lastDurationMs;
+        }
+
+        endMs = clampEndTime(startMs, endMs, minDurationMs);
+
+        // テキストが空のものは落とす（必要なら残す）
+        const text = (cur.text || "").trim();
+        if (!text) continue;
+
+        const index = out.length + 1;
+        out.push([
+          String(index),
+          `${formatMsToSrtTime(startMs)} --> ${formatMsToSrtTime(endMs)}`,
+          text,
+          "" // 空行
+        ].join("\n"));
+      }
+
+      if (out.length === 0) {
+        throw new Error("字幕本文が取得できませんでした（<p>が空、または全て空白）。");
+      }
+
+      return out.join("\n");
+    }
+
+    function extractTextFromDiv(divEl) {
+      // pを順に拾って行にする（top順ソートはせず、XML上の順序を採用）
+      const ps = Array.from(divEl.getElementsByTagName("p"));
+      if (ps.length === 0) {
+        // pが無い場合は div のテキスト全体を拾う保険（余計な空白は整理）
+        const t = (divEl.textContent || "").replace(/\s+\n/g, "\n").trim();
+        return normalizeNewlines(t);
+      }
+
+      const lines = ps.map(p => {
+        // textContentはCDATAも普通に取り出せる
+        return normalizeNewlines((p.textContent || "")).trim();
+      }).filter(Boolean);
+
+      return lines.join("\n");
+    }
+
+    async function handleFileSelect(evt) {
+      const file = evt.target.files[0];
+      if (!file) return;
+
+      const encodingMode = document.getElementById('encodingSelect').value;
+      const lastDurationSec = parseFloat(document.getElementById('lastDurationSec').value || "2.0");
+      const endMinus1ms = document.getElementById('chkEndMinus1ms').checked;
+      const minDurationMs = parseInt(document.getElementById('minDurationMs').value || "0", 10);
+
+      const options = {
+        lastDurationSec: isFinite(lastDurationSec) ? lastDurationSec : 2.0,
+        endMinus1ms,
+        minDurationMs: isFinite(minDurationMs) ? minDurationMs : 0
+      };
+
+      try {
+        const { text, usedEncoding } = await readFileWithEncoding(file, encodingMode);
+        const srtContent = convertGcmlToSrt(text, options);
+
+        const outputFilename = file.name
+          .replace(/\.gcml$/i, '')
+          .replace(/\.xml$/i, '') + '.srt';
+
+        downloadFile(srtContent, outputFilename, 'text/plain;charset=utf-8');
+
+        document.getElementById('status').innerText =
+          `変換完了: ${outputFilename} をダウンロードしました。（読み込み: ${usedEncoding}, div: 推定方式）`;
+      } catch (err) {
+        document.getElementById('status').innerText = `エラー: ${err.message}`;
+      }
+    }
+  </script>
+</body>
+</html>
